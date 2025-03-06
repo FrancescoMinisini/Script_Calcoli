@@ -5,21 +5,21 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 
-def process_file(file_path, baseline, weight):
+def process_file(file_path, baseline, weight, output_dir):
     """
     Elabora un singolo file CSV (il file n.1 di ciclo) per eseguire i calcoli:
-      - Sottrazione dei valori basali da S0, S1, S2.
+      - Sottrazione dei valori basali da S0, S1 e S2.
       - Calcolo della norma dell'accelerazione e del rapporto |Az|/norm.
       - Calcolo del range (max-min) per S0,S1,S2, diviso per il peso.
       - Calcolo della durata (Timestamp finale - Timestamp iniziale).
       - Calcolo della distanza temporale tra i picchi (massimi e minimi) per S0,S1,S2.
-      - Calcolo dell'angolo del vettore magnetometrico rispetto alla verticale (Y).
-      - Salvataggio di un grafico dell'angolo vs Timestamp.
+      - Calcolo dell'angolo del vettore magnetometrico rispetto alla verticale (asse Y).
+      - Salvataggio di un grafico dell'angolo vs Timestamp nell'output_dir.
     """
     # Legge il CSV
     df = pd.read_csv(file_path)
     
-    # Sottrazione dei valori basali (input utente) da S0, S1 e S2
+    # Sottrazione dei valori basali da S0, S1 e S2
     df['S0'] = df['S0'] - baseline[0]
     df['S1'] = df['S1'] - baseline[1]
     df['S2'] = df['S2'] - baseline[2]
@@ -41,7 +41,7 @@ def process_file(file_path, baseline, weight):
     # Durata del ciclo (Timestamp finale - iniziale)
     duration = df['Timestamp'].iloc[-1] - df['Timestamp'].iloc[0]
     
-    # Calcolo della distanza temporale tra picchi (max) e tra minimi per S0, S1, S2
+    # Calcolo della distanza temporale tra picchi (max) e tra minimi per S0,S1,S2
     max_timestamps = []
     min_timestamps = []
     for col in ['S0', 'S1', 'S2']:
@@ -53,20 +53,21 @@ def process_file(file_path, baseline, weight):
     temporal_distance_min = max(min_timestamps) - min(min_timestamps)
     
     # Calcolo dell'angolo del vettore magnetometrico rispetto alla verticale (asse Y)
-    # Verticale = [0, 1, 0]. Calcolo: angolo = arccos(My/||M||)
+    # Calcolo: angolo = arccos(My/||M||)
     mag_norm = np.sqrt(df['Mx']**2 + df['My']**2 + df['Mz']**2)
-    # Per evitare divisioni per zero
     df['mag_angle'] = np.degrees(np.arccos(df['My'] / mag_norm))
     mag_angle_mean = df['mag_angle'].mean()
     mag_angle_std = df['mag_angle'].std()
     
-    # Salva il grafico dell'angolo magnetometrico vs Timestamp
+    # Salva il grafico dell'angolo magnetometrico vs Timestamp nella cartella output_dir
     plt.figure()
     plt.plot(df['Timestamp'], df['mag_angle'])
     plt.xlabel('Timestamp')
     plt.ylabel('Angolo Magnetometro (gradi)')
     plt.title('Angolo Magnetometro vs Timestamp')
-    plot_file = file_path.replace('.csv', '_mag_angle_plot.png')
+    # Costruisco il nome del file PNG in base al nome del file elaborato
+    base_name = os.path.basename(file_path).replace('.csv', '_mag_angle_plot.png')
+    plot_file = os.path.join(output_dir, base_name)
     plt.savefig(plot_file)
     plt.close()
     
@@ -99,12 +100,13 @@ def process_durations(folder):
     else:
         return None, None
 
-def process_foot(foot_folder, baseline, weight):
+def process_foot(foot_folder, baseline, weight, output_dir):
     """
     Per una data cartella di un piede (Piede_Destro o Piede_Sinistro)
     esegue:
       - Elaborazione del file ciclo (primo file in "Passi_Interi")
       - Calcolo delle durate medie (e dev. std) per ciclo e mezzo ciclo.
+    I risultati vengono salvati nella cartella output_dir.
     Ritorna i risultati in un dizionario strutturato.
     """
     # Percorsi delle cartelle dei passi
@@ -117,7 +119,7 @@ def process_foot(foot_folder, baseline, weight):
         return None
     # Utilizzo il primo file di ciclo (file n.1)
     cycle_file = cycle_files[0]
-    cycle_results = process_file(cycle_file, baseline, weight)
+    cycle_results = process_file(cycle_file, baseline, weight, output_dir)
     
     # Calcola durata media e dev. std per tutti i file in ciascuna cartella
     cycle_duration_mean, cycle_duration_std = process_durations(passi_interni_folder)
@@ -151,24 +153,29 @@ def main():
         sys.exit(1)
     baseline = (baseline_S0, baseline_S1, baseline_S2)
     
-    # Mappa per i nomi delle cartelle dei piedi
-    results = {}
+    # Creazione della struttura di output: cartella "calcoli" con sottocartelle per ciascun piede
+    calcoli_dir = os.path.join(main_folder, "calcoli")
+    os.makedirs(calcoli_dir, exist_ok=True)
     foot_mapping = {
         'Piede_Destro': 'piede_destro',
         'Piede_Sinistro': 'piede_sinistro'
     }
-    for foot_name in foot_mapping:
+    
+    results = {}
+    for foot_name, folder_name in foot_mapping.items():
         foot_folder = os.path.join(main_folder, 'passi', foot_name)
+        output_folder = os.path.join(calcoli_dir, folder_name)
+        os.makedirs(output_folder, exist_ok=True)
         if not os.path.exists(foot_folder):
             print("Cartella non trovata:", foot_folder)
             continue
-        res = process_foot(foot_folder, baseline, weight)
+        res = process_foot(foot_folder, baseline, weight, output_folder)
         if res is not None:
-            results[foot_mapping[foot_name]] = res
+            results[folder_name] = (res, output_folder)
     
-    # Scrive i risultati in due file di testo (uno per piede) nella cartella principale
-    for foot_key, res in results.items():
-        output_file = os.path.join(main_folder, f"risultati_{foot_key}.txt")
+    # Scrive i risultati in un file di testo in ciascuna sottocartella di "calcoli"
+    for foot_key, (res, output_folder) in results.items():
+        output_file = os.path.join(output_folder, f"risultati_{foot_key}.txt")
         with open(output_file, 'w') as f:
             f.write(f"Risultati per {foot_key}:\n")
             f.write(f"File ciclo usato: {res['cycle_file']}\n\n")
