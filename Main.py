@@ -1,327 +1,206 @@
-import os
-import glob
-import pandas as pd
-import numpy as np
-import math
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
+# gait_analysis.py   –   April 2025
+# ---------------------------------------------------------------
+# CONFIG
+IGNORE_EDGE_STEPS = True   # False -> include all files
+EDGE_FULL_SKIP    = 1      # full steps skipped head/tail
+EDGE_HALF_SKIP    = 2      # half-step pairs (.1/.2) skipped head/tail
+RESAMPLE_POINTS   = 100    # points for normalised curves
+# ---------------------------------------------------------------
 
-def resample_series(series, N=100):
-    """
-    Risample un array (o una serie) su una griglia di N punti in tempo normalizzato [0,1].
-    """
-    x_orig = np.linspace(0, 1, len(series))
-    x_new = np.linspace(0, 1, N)
-    resampled = np.interp(x_new, x_orig, series)
-    return resampled
+import os, glob, re, numpy as np, pandas as pd, matplotlib.pyplot as plt
 
-def process_single_step(file_path, baseline, weight):
-    """
-    Elabora un singolo file CSV (un passo o un emiciclo) e ritorna un dizionario contenente:
-      - duration: durata del passo (Timestamp finale - Timestamp iniziale)
-      - s0_range, s1_range, s2_range: range (max-min) di S0, S1, S2 (dopo baseline), diviso per il peso
-      - lat_acc_ratio: rapporto Az/||A|| per ogni campione (con media e std calcolabili sul passo)
-      - resampled_ratio: versione risample (100 punti) del rapporto, per il plot aggregato
-      - mag_angle: angolo del magnetometro rispetto alla verticale (asse Y) per ogni campione, con media e std
-          * Se si desidera centrare l’angolo a 0, decommentare la riga indicata.
-      - resampled_mag_angle: versione risample (100 punti) dell’angolo magnetico, per il plot aggregato
-      - temporal_distance_max e temporal_distance_min: differenza temporale fra i picchi di S0,S1,S2.
-    """
-    df = pd.read_csv(file_path)
-    
-    # Sottrazione dei valori basali per S0, S1 e S2
-    df['S0'] = df['S0'] - baseline[0]
-    df['S1'] = df['S1'] - baseline[1]
-    df['S2'] = df['S2'] - baseline[2]
-    
-    # Durata del passo/emiciclo (Timestamp finale - iniziale)
-    duration = df['Timestamp'].iloc[-1] - df['Timestamp'].iloc[0]
-    
-    # Range per le pressioni (diviso per il peso)
-    s0_range = (df['S0'].max() - df['S0'].min()) / weight
-    s1_range = (df['S1'].max() - df['S1'].min()) / weight
-    s2_range = (df['S2'].max() - df['S2'].min()) / weight
-    
-    # Calcolo della norma dell'accelerazione e rapporto Az/||A||
-    acc_norm = np.sqrt(df['Ax']**2 + df['Ay']**2 + df['Az']**2)
-    # Se la norma è zero, imposto il rapporto a zero per evitare divisioni per zero
-    ratio = np.where(acc_norm == 0, 0, df['Az'] / acc_norm)
-    lat_acc_mean = np.mean(ratio)
-    lat_acc_std = np.std(ratio)
-    resampled_ratio = resample_series(ratio, 100)
-    
-    # Calcolo dell'angolo del magnetometro rispetto alla verticale (asse Y)
-    mag_norm = np.sqrt(df['Mx']**2 + df['My']**2 + df['Mz']**2)
-    # Limito il rapporto tra My e la norma a [-1,1] per evitare errori di dominio
-    cos_val = np.clip(df['My'] / mag_norm, -1, 1)
-    mag_angle = np.degrees(np.arccos(cos_val))
-    # Se si desidera centrare l'angolo a 0 (cioè far sì che la verticale corrisponda a 0 gradi),
-    # decommentare la seguente riga:
-    # mag_angle = mag_angle - np.mean(mag_angle)
-    mag_angle_mean = np.mean(mag_angle)
-    mag_angle_std = np.std(mag_angle)
-    resampled_mag_angle = resample_series(mag_angle, 100)
-    
-    # Calcolo della distanza temporale tra i picchi per S0,S1,S2:
-    max_times = [df['Timestamp'].max() for col in ['S0','S1','S2']]  # I valori massimi non dipendono dalla colonna: uso .max() su df[col]
-    min_times = [df['Timestamp'].min() for col in ['S0','S1','S2']]
-    temporal_distance_max = max(max_times) - min(max_times)
-    temporal_distance_min = max(min_times) - min(min_times)
-    
-    return {
-        'file': file_path,
-        'duration': duration,
-        's0_range': s0_range,
-        's1_range': s1_range,
-        's2_range': s2_range,
-        'lat_acc_mean': lat_acc_mean,
-        'lat_acc_std': lat_acc_std,
-        'resampled_ratio': resampled_ratio,
-        'mag_angle_mean': mag_angle_mean,
-        'mag_angle_std': mag_angle_std,
-        'resampled_mag_angle': resampled_mag_angle,
-        'temporal_distance_max': temporal_distance_max,
-        'temporal_distance_min': temporal_distance_min
-    }
+_num_full = re.compile(r"Passo[_ ]?(\d+)\.csv$", re.I)
+_num_half = re.compile(r"Passo[_ ]?(\d+)\.(1|2)\.csv$", re.I)
 
-def process_steps(folder, baseline, weight):
-    """
-    Elabora tutti i file CSV (passi o emicicli) presenti nella cartella 'folder'.
-    Ritorna una lista di dizionari, uno per ogni file elaborato.
-    """
-    files = sorted(glob.glob(os.path.join(folder, '*.csv')))
-    steps = []
-    for file in files:
-        try:
-            step_metrics = process_single_step(file, baseline, weight)
-            steps.append(step_metrics)
-        except Exception as e:
-            print(f"Errore nell'elaborazione del file {file}: {e}")
-    return steps
+# ------------------ helpers -----------------------------------
+def resample(series, n=RESAMPLE_POINTS):
+    x_old = np.linspace(0.0, 1.0, len(series))
+    x_new = np.linspace(0.0, 1.0, n)
+    return np.interp(x_new, x_old, series)
 
-def aggregate_metrics(steps):
-    """
-    Data una lista di dizionari (uno per ogni passo o emiciclo), calcola le statistiche aggregate:
-      - Media e deviazione standard per ciascuna metrica (durata, range S0,S1,S2, lat_acc, magnetometro, distanze temporali)
-      - Aggrega le serie risample (100 punti) per il rapporto Az/||A|| e per l'angolo magnetico.
-    Ritorna un dizionario con i valori aggregati.
-    """
-    if len(steps) == 0:
-        return {}
-    durations = [s['duration'] for s in steps]
-    s0_ranges = [s['s0_range'] for s in steps]
-    s1_ranges = [s['s1_range'] for s in steps]
-    s2_ranges = [s['s2_range'] for s in steps]
-    lat_acc_means = [s['lat_acc_mean'] for s in steps]
-    lat_acc_stds = [s['lat_acc_std'] for s in steps]
-    mag_angle_means = [s['mag_angle_mean'] for s in steps]
-    mag_angle_stds = [s['mag_angle_std'] for s in steps]
-    temporal_distance_maxs = [s['temporal_distance_max'] for s in steps]
-    temporal_distance_mins = [s['temporal_distance_min'] for s in steps]
-    
-    # Aggrego le serie risample per il rapporto Az/||A||
-    resampled_matrix = np.array([s['resampled_ratio'] for s in steps])
-    resampled_mean = np.mean(resampled_matrix, axis=0)
-    resampled_std = np.std(resampled_matrix, axis=0)
-    
-    # Aggrego le serie risample per l'angolo magnetico
-    resampled_mag_matrix = np.array([s['resampled_mag_angle'] for s in steps])
-    resampled_mag_mean = np.mean(resampled_mag_matrix, axis=0)
-    resampled_mag_std = np.std(resampled_mag_matrix, axis=0)
-    
-    aggregated = {
-        'duration_mean': np.mean(durations),
-        'duration_std': np.std(durations),
-        's0_range_mean': np.mean(s0_ranges),
-        's0_range_std': np.std(s0_ranges),
-        's1_range_mean': np.mean(s1_ranges),
-        's1_range_std': np.std(s1_ranges),
-        's2_range_mean': np.mean(s2_ranges),
-        's2_range_std': np.std(s2_ranges),
-        'lat_acc_mean_mean': np.mean(lat_acc_means),
-        'lat_acc_mean_std': np.std(lat_acc_means),
-        'lat_acc_std_mean': np.mean(lat_acc_stds),
-        'lat_acc_std_std': np.std(lat_acc_stds),
-        'mag_angle_mean_mean': np.mean(mag_angle_means),
-        'mag_angle_mean_std': np.std(mag_angle_means),
-        'mag_angle_std_mean': np.mean(mag_angle_stds),
-        'mag_angle_std_std': np.std(mag_angle_stds),
-        'temporal_distance_max_mean': np.mean(temporal_distance_maxs),
-        'temporal_distance_max_std': np.std(temporal_distance_maxs),
-        'temporal_distance_min_mean': np.mean(temporal_distance_mins),
-        'temporal_distance_min_std': np.std(temporal_distance_mins),
-        'resampled_mean': resampled_mean,
-        'resampled_std': resampled_std,
-        'resampled_mag_mean': resampled_mag_mean,
-        'resampled_mag_std': resampled_mag_std
-    }
-    return aggregated
+def process_single_step(csv_file, baseline, weight):
+    df = pd.read_csv(csv_file)
 
-def generate_plot(x, mean, std, output_file, xlabel, ylabel, title):
-    """
-    Genera un plot con x sull'asse (tempo normalizzato) e la curva media (mean) con una fascia che rappresenta lo std.
-    """
-    plt.figure()
-    plt.plot(x, mean, label="Media")
-    plt.fill_between(x, mean - std, mean + std, alpha=0.3, label="Deviazione Std")
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend()
-    plt.savefig(output_file)
-    plt.close()
+    for i, col in enumerate(["S0","S1","S2"]):
+        df[col] -= baseline[i]
 
-def generate_concatenated_plot(x, series, n_steps, output_file):
-    """
-    Genera un plot in cui viene mostrata la concatenazione (in ordine) dell'angolo magnetico di ogni passo.
-    Vengono tracciate anche delle linee verticali per indicare il confine tra i passi.
-    """
-    plt.figure()
-    plt.plot(x, series, label="Angolo Magnetico")
-    step_length = len(series) / n_steps
-    for i in range(1, n_steps):
-        plt.axvline(x=i*step_length, color='gray', linestyle='--', linewidth=0.5)
-    plt.xlabel("Campioni concatenati (passi consecutivi)")
-    plt.ylabel("Angolo Magnetico (gradi)")
-    plt.title("Angolo Magnetico su tutti i passi")
-    plt.legend()
-    plt.savefig(output_file)
-    plt.close()
+    duration = df["Timestamp"].iloc[-1] - df["Timestamp"].iloc[0]
+    ranges   = {c:(df[c].max()-df[c].min())/weight for c in ["S0","S1","S2"]}
 
+    a_norm = np.sqrt(df["Ax"]**2+df["Ay"]**2+df["Az"]**2)
+    ratio  = np.where(a_norm==0, 0, df["Az"]/a_norm)
+    ratio_res = resample(ratio)
+
+    m_norm = np.sqrt(df["Mx"]**2+df["My"]**2+df["Mz"]**2)
+    angle  = np.degrees(np.arccos(np.clip(df["My"]/m_norm, -1.0, 1.0)))
+    angle_res = resample(angle)
+
+    max_t = {c: df.loc[df[c].idxmax(),"Timestamp"] for c in ["S0","S1","S2"]}
+    min_t = {c: df.loc[df[c].idxmin(),"Timestamp"] for c in ["S0","S1","S2"]}
+
+    return dict(file=csv_file,
+                n_samples=len(df),
+                duration=duration,
+                ranges=ranges,
+                ratio_mean=ratio.mean(),
+                ratio_std=ratio.std(),
+                ratio_res=ratio_res,
+                angle_mean=angle.mean(),
+                angle_std=angle.std(),
+                angle_res=angle_res,
+                max_t=max_t,
+                min_t=min_t)
+
+def _full_key(p):  m=_num_full.search(os.path.basename(p)); return int(m.group(1)) if m else 0
+def load_full_steps(folder, base, w):
+    paths = sorted(glob.glob(os.path.join(folder,"*.csv")), key=_full_key)
+    if IGNORE_EDGE_STEPS and len(paths)>2*EDGE_FULL_SKIP:
+        paths = paths[EDGE_FULL_SKIP:-EDGE_FULL_SKIP]
+    return [process_single_step(p, base, w) for p in paths]
+
+def load_half_steps(folder, base, w):
+    pairs={}
+    for p in glob.glob(os.path.join(folder,"*.csv")):
+        m=_num_half.search(os.path.basename(p))
+        if m: pairs.setdefault(int(m.group(1)),{})[int(m.group(2))]=p
+    nums=sorted(pairs)
+    if IGNORE_EDGE_STEPS and len(nums)>2*EDGE_HALF_SKIP:
+        nums = nums[EDGE_HALF_SKIP:-EDGE_HALF_SKIP]
+    first,second=[],[]
+    for n in nums:
+        if 1 in pairs[n]: first .append(process_single_step(pairs[n][1], base, w))
+        if 2 in pairs[n]: second.append(process_single_step(pairs[n][2], base, w))
+    return first,second
+
+def aggregate(steps):
+    if not steps: return {}
+    n_samp = np.array([s["n_samples"] for s in steps])
+    ratio_m= np.array([s["ratio_mean"] for s in steps])
+    ratio_global = (ratio_m * n_samp).sum() / n_samp.sum()
+
+    durations = np.array([s["duration"] for s in steps])
+    angle_m   = np.array([s["angle_mean"] for s in steps])
+    ranges = {c: np.array([s["ranges"][c] for s in steps]) for c in ["S0","S1","S2"]}
+    ratio_mat = np.vstack([s["ratio_res"] for s in steps])
+    angle_mat = np.vstack([s["angle_res"] for s in steps])
+
+    dist={}
+    for c in ["S0","S1","S2"]:
+        mx=np.array([s["max_t"][c] for s in steps])
+        mn=np.array([s["min_t"][c] for s in steps])
+        dist[f"{c}_max"]=np.diff(mx) if len(mx)>1 else np.array([])
+        dist[f"{c}_min"]=np.diff(mn) if len(mn)>1 else np.array([])
+
+    return dict(
+        n_steps=len(steps),
+        dur_mean=durations.mean(), dur_std=durations.std(),
+        ratio_mean_of_means=ratio_m.mean(), ratio_mean_std=ratio_m.std(),
+        ratio_mean_all_samples=ratio_global,
+        angle_mean=angle_m.mean(), angle_mean_std=angle_m.std(),
+        ranges_mean={c:ranges[c].mean() for c in ranges},
+        ranges_std={c:ranges[c].std() for c in ranges},
+        ratio_curve_m=ratio_mat.mean(0), ratio_curve_s=ratio_mat.std(0),
+        angle_curve_m=angle_mat.mean(0), angle_curve_s=angle_mat.std(0),
+        dist=dist)
+
+def plot_mean_std(x, m, s, out, ylab, title):
+    plt.figure(); plt.plot(x,m,label="mean")
+    plt.fill_between(x,m-s,m+s,alpha=.3,label="std")
+    plt.xlabel("time norm (%)"); plt.ylabel(ylab); plt.title(title)
+    plt.legend(); plt.tight_layout(); plt.savefig(out); plt.close()
+
+def plot_concat(lst, out, ylab, title):
+    c=np.concatenate(lst); seg=len(lst[0])
+    plt.figure(); plt.plot(c)
+    for i in range(1,len(lst)): plt.axvline(i*seg,color="gray",ls="--",lw=.5)
+    plt.xlabel("concatenated samples"); plt.ylabel(ylab); plt.title(title)
+    plt.tight_layout(); plt.savefig(out); plt.close()
+
+# ------------------------------- main --------------------------------------
 def main():
-    import sys
-    # Richiede all'utente il path della cartella principale e il peso
-    main_folder = input("Inserisci il path della cartella generale: ").strip()
-    try:
-        weight = float(input("Inserisci il peso del soggetto (in kg): ").strip())
-    except ValueError:
-        print("Peso non valido")
-        sys.exit(1)
-    
-    # Richiede i valori basali per il piede DESTRO
-    print("\nInserisci i valori basali per il piede DESTRO:")
-    try:
-        baseline_S0_right = float(input("Valore basale per S0: ").strip())
-        baseline_S1_right = float(input("Valore basale per S1: ").strip())
-        baseline_S2_right = float(input("Valore basale per S2: ").strip())
-    except ValueError:
-        print("Valore basale non valido")
-        sys.exit(1)
-    baseline_right = (baseline_S0_right, baseline_S1_right, baseline_S2_right)
-    
-    # Richiede i valori basali per il piede SINISTRO
-    print("\nInserisci i valori basali per il piede SINISTRO:")
-    try:
-        baseline_S0_left = float(input("Valore basale per S0: ").strip())
-        baseline_S1_left = float(input("Valore basale per S1: ").strip())
-        baseline_S2_left = float(input("Valore basale per S2: ").strip())
-    except ValueError:
-        print("Valore basale non valido")
-        sys.exit(1)
-    baseline_left = (baseline_S0_left, baseline_S1_left, baseline_S2_left)
-    
-    # Mappa dei piedi: le cartelle sotto 'passi' sono "Piede_Destro" e "Piede_Sinistro"
-    # per ciascuna si indica anche il nome della sottocartella di output e i rispettivi basali.
-    foot_mapping = {
-        "Piede_Destro": ("piede_destro", baseline_right),
-        "Piede_Sinistro": ("piede_sinistro", baseline_left)
-    }
-    
-    # Creazione della cartella "calcoli" all'interno della cartella principale
-    calcoli_dir = os.path.join(main_folder, "calcoli")
-    os.makedirs(calcoli_dir, exist_ok=True)
-    
-    for foot_folder_name, (output_folder_name, baseline) in foot_mapping.items():
-        foot_folder = os.path.join(main_folder, "passi", foot_folder_name)
-        if not os.path.exists(foot_folder):
-            print("Cartella non trovata:", foot_folder)
-            continue
-        # Crea la cartella di output per questo piede
-        output_dir = os.path.join(calcoli_dir, output_folder_name)
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Elaborazione dei passi interi
-        full_steps_folder = os.path.join(foot_folder, "Passi_Interi")
-        full_steps_metrics = process_steps(full_steps_folder, baseline, weight)
-        
-        # Elaborazione degli emicicli
-        half_steps_folder = os.path.join(foot_folder, "Mezzi_Passi")
-        half_steps_all = process_steps(half_steps_folder, baseline, weight)
-        # Divido in primi e secondi emicicli (supponendo che i file siano ordinati)
-        first_half_metrics = [step for i, step in enumerate(half_steps_all) if i % 2 == 0]
-        second_half_metrics = [step for i, step in enumerate(half_steps_all) if i % 2 == 1]
-        
-        # Calcolo delle statistiche aggregate
-        aggregated_full = aggregate_metrics(full_steps_metrics)
-        aggregated_first_half = aggregate_metrics(first_half_metrics) if first_half_metrics else {}
-        aggregated_second_half = aggregate_metrics(second_half_metrics) if second_half_metrics else {}
-        
-        # Genera il plot per il rapporto Az/||A|| (media e std istante per istante)
-        x_common = np.linspace(0, 100, 100)  # asse x in percentuale (0-100%)
-        if "resampled_mean" in aggregated_full:
-            plot_file_ratio = os.path.join(output_dir, f"lat_acc_ratio_plot_{output_folder_name}.png")
-            generate_plot(x_common, aggregated_full["resampled_mean"], aggregated_full["resampled_std"],
-                          plot_file_ratio, "Tempo normalizzato (%)", "Rapporto Az/||A||",
-                          "Media istante per istante di Az/||A|| con banda std")
-        
-        # Genera il plot per l'angolo magnetico medio (media istante per istante) con banda std
-        if "resampled_mag_mean" in aggregated_full:
-            plot_file_mag_avg = os.path.join(output_dir, f"mag_angle_avg_plot_{output_folder_name}.png")
-            generate_plot(x_common, aggregated_full["resampled_mag_mean"], aggregated_full["resampled_mag_std"],
-                          plot_file_mag_avg, "Tempo normalizzato (%)", "Angolo Magnetico (gradi)",
-                          "Media istante per istante dell'angolo magnetico con banda std")
-        
-        # Genera il plot concatenato per l'angolo magnetico su tutti i passi
-        if len(full_steps_metrics) > 0:
-            concatenated_mag = np.concatenate([s['resampled_mag_angle'] for s in full_steps_metrics])
-            x_concat = np.arange(len(concatenated_mag))
-            plot_file_mag_concat = os.path.join(output_dir, f"mag_angle_concat_plot_{output_folder_name}.png")
-            generate_concatenated_plot(x_concat, concatenated_mag, len(full_steps_metrics), plot_file_mag_concat)
-        
-        # Salva i risultati in un file di testo nella cartella di output
-        results_file = os.path.join(output_dir, f"risultati_{output_folder_name}.txt")
-        with open(results_file, 'w') as f:
-            f.write(f"Risultati per {output_folder_name}:\n\n")
-            f.write("----- PASSI INTERI -----\n")
-            f.write(f"Numero di passi: {len(full_steps_metrics)}\n")
-            f.write(f"Durata media: {aggregated_full.get('duration_mean', 'N/A')} (std: {aggregated_full.get('duration_std', 'N/A')})\n")
-            f.write(f"S0 range medio: {aggregated_full.get('s0_range_mean', 'N/A')} (std: {aggregated_full.get('s0_range_std', 'N/A')})\n")
-            f.write(f"S1 range medio: {aggregated_full.get('s1_range_mean', 'N/A')} (std: {aggregated_full.get('s1_range_std', 'N/A')})\n")
-            f.write(f"S2 range medio: {aggregated_full.get('s2_range_mean', 'N/A')} (std: {aggregated_full.get('s2_range_std', 'N/A')})\n")
-            f.write(f"Lat Acc (Az/||A||) media: {aggregated_full.get('lat_acc_mean_mean', 'N/A')} (std: {aggregated_full.get('lat_acc_mean_std', 'N/A')})\n")
-            f.write(f"Lat Acc (Az/||A||) std: {aggregated_full.get('lat_acc_std_mean', 'N/A')} (std: {aggregated_full.get('lat_acc_std_std', 'N/A')})\n")
-            f.write(f"Magnetometro angle media: {aggregated_full.get('mag_angle_mean_mean', 'N/A')} (std: {aggregated_full.get('mag_angle_mean_std', 'N/A')})\n")
-            f.write(f"Magnetometro angle std: {aggregated_full.get('mag_angle_std_mean', 'N/A')} (std: {aggregated_full.get('mag_angle_std_std', 'N/A')})\n")
-            f.write(f"Temporal distance max (S0,S1,S2): {aggregated_full.get('temporal_distance_max_mean', 'N/A')} (std: {aggregated_full.get('temporal_distance_max_std', 'N/A')})\n")
-            f.write(f"Temporal distance min (S0,S1,S2): {aggregated_full.get('temporal_distance_min_mean', 'N/A')} (std: {aggregated_full.get('temporal_distance_min_std', 'N/A')})\n")
-            f.write("\n----- EMICICLI -----\n")
-            f.write("Primi emicicli:\n")
-            if aggregated_first_half:
-                f.write(f"  Numero di emicicli: {len(first_half_metrics)}\n")
-                f.write(f"  Durata media: {aggregated_first_half.get('duration_mean', 'N/A')} (std: {aggregated_first_half.get('duration_std', 'N/A')})\n")
-            else:
-                f.write("  Nessun dato.\n")
-            f.write("Secondi emicicli:\n")
-            if aggregated_second_half:
-                f.write(f"  Numero di emicicli: {len(second_half_metrics)}\n")
-                f.write(f"  Durata media: {aggregated_second_half.get('duration_mean', 'N/A')} (std: {aggregated_second_half.get('duration_std', 'N/A')})\n")
-            else:
-                f.write("  Nessun dato.\n")
-            f.write("\n----- METRICHE PER OGNI PASSO -----\n")
-            for i, step in enumerate(full_steps_metrics):
-                f.write(f"Passo {i+1}:\n")
-                f.write(f"  File: {step['file']}\n")
-                f.write(f"  Durata: {step['duration']}\n")
-                f.write(f"  S0 range: {step['s0_range']}\n")
-                f.write(f"  S1 range: {step['s1_range']}\n")
-                f.write(f"  S2 range: {step['s2_range']}\n")
-                f.write(f"  Lat Acc (Az/||A||) mean: {step['lat_acc_mean']}\n")
-                f.write(f"  Lat Acc (Az/||A||) std: {step['lat_acc_std']}\n")
-                f.write(f"  Magnetometro angle mean: {step['mag_angle_mean']}\n")
-                f.write(f"  Magnetometro angle std: {step['mag_angle_std']}\n")
-                f.write(f"  Temporal distance max: {step['temporal_distance_max']}\n")
-                f.write(f"  Temporal distance min: {step['temporal_distance_min']}\n")
-                f.write("\n")
-        print(f"Risultati salvati in: {results_file}")
+    root=input("Main folder path: ").strip()
+    weight=float(input("Weight kg: ").strip())
+    print("\nBaselines RIGHT"); base_r=tuple(float(input(f"S{i}: ").strip()) for i in range(3))
+    print("\nBaselines LEFT");  base_l=tuple(float(input(f"S{i}: ").strip()) for i in range(3))
 
-if __name__ == '__main__':
+    feet={"Piede_Destro":("right",base_r),"Piede_Sinistro":("left",base_l)}
+    out_root=os.path.join(root,"calcoli"); os.makedirs(out_root,exist_ok=True)
+    x_norm=np.linspace(0,100,RESAMPLE_POINTS)
+
+    for fd,(tag,base) in feet.items():
+        path=os.path.join(root,"passi",fd)
+        if not os.path.isdir(path): print("missing",path); continue
+        out=os.path.join(out_root,tag); os.makedirs(out,exist_ok=True)
+
+        full=load_full_steps(os.path.join(path,"Passi_Interi"),base,weight)
+        first,second=load_half_steps(os.path.join(path,"Mezzi_Passi"),base,weight)
+
+        agg_full  =aggregate(full)
+        agg_first =aggregate(first)
+        agg_second=aggregate(second)
+
+        if agg_full:
+            plot_mean_std(x_norm,agg_full["ratio_curve_m"],agg_full["ratio_curve_s"],
+                          os.path.join(out,"ratio_mean_std.png"),
+                          "Az/|A|","Az/|A| mean std")
+            plot_mean_std(x_norm,agg_full["angle_curve_m"],agg_full["angle_curve_s"],
+                          os.path.join(out,"angle_mean_std.png"),
+                          "mag angle deg","mag angle mean std")
+            plot_concat([s["angle_res"] for s in full],
+                        os.path.join(out,"angle_concat.png"),
+                        "mag angle deg","mag angle concatenated steps")
+
+        txt=os.path.join(out,"results.txt")
+        with open(txt,"w") as f:
+            f.write(f"RESULTS {tag.upper()}\n\nFULL STEPS\n")
+            if agg_full:
+                f.write(f"steps analysed           : {agg_full['n_steps']}\n")
+                f.write(f"duration mean std        : {agg_full['dur_mean']} {agg_full['dur_std']}\n")
+                for c in ["S0","S1","S2"]:
+                    f.write(f"{c} range mean std         : {agg_full['ranges_mean'][c]} {agg_full['ranges_std'][c]}\n")
+                f.write(f"Az/|A| mean of means std : {agg_full['ratio_mean_of_means']} {agg_full['ratio_mean_std']}\n")
+                f.write(f"Az/|A| mean all samples  : {agg_full['ratio_mean_all_samples']}\n")
+                f.write(f"mag angle mean std       : {agg_full['angle_mean']} {agg_full['angle_mean_std']}\n")
+                for c in ["S0","S1","S2"]:
+                    dmax=agg_full["dist"][f"{c}_max"]; dmin=agg_full["dist"][f"{c}_min"]
+                    if len(dmax):
+                        f.write(f"distance max {c} mean std: {dmax.mean()} {dmax.std()}\n")
+                        f.write(f"distance min {c} mean std: {dmin.mean()} {dmin.std()}\n")
+            else: f.write("no data\n")
+            f.write("\nFIRST HALF STEPS (.1)\n")
+            if agg_first:
+                f.write(f"count                    : {agg_first['n_steps']}\n")
+                f.write(f"duration mean std        : {agg_first['dur_mean']} {agg_first['dur_std']}\n")
+                f.write(f"Az/|A| mean of means std : {agg_first['ratio_mean_of_means']} {agg_first['ratio_mean_std']}\n")
+            else: f.write("no data\n")
+            f.write("\nSECOND HALF STEPS (.2)\n")
+            if agg_second:
+                f.write(f"count                    : {agg_second['n_steps']}\n")
+                f.write(f"duration mean std        : {agg_second['dur_mean']} {agg_second['dur_std']}\n")
+                f.write(f"Az/|A| mean of means std : {agg_second['ratio_mean_of_means']} {agg_second['ratio_mean_std']}\n")
+            else: f.write("no data\n")
+            f.write("\nSTEP BY STEP DETAILS\n")
+            prev_max={c:None for c in ["S0","S1","S2"]}
+            prev_min={c:None for c in ["S0","S1","S2"]}
+            for s in full:
+                name=os.path.basename(s["file"])
+                f.write("-"*60+"\nfile                : "+name+"\n")
+                f.write(f"duration            : {s['duration']}\n")
+                for c in ["S0","S1","S2"]:
+                    f.write(f"{c} range           : {s['ranges'][c]}\n")
+                f.write(f"Az/|A| mean std     : {s['ratio_mean']} {s['ratio_std']}\n")
+                f.write(f"mag angle mean std  : {s['angle_mean']} {s['angle_std']}\n")
+                for c in ["S0","S1","S2"]:
+                    cmx, cmn = s["max_t"][c], s["min_t"][c]
+                    f.write(f"{c} max timestamp     : {cmx}\n")
+                    f.write(f"{c} min timestamp     : {cmn}\n")
+                    if prev_max[c] is not None:
+                        f.write(f"{c} dist max to prev  : {cmx-prev_max[c]}\n")
+                        f.write(f"{c} dist min to prev  : {cmn-prev_min[c]}\n")
+                    prev_max[c],prev_min[c]=cmx,cmn
+                f.write("\n")
+        print("created",txt)
+
+if __name__ == "__main__":
     main()
