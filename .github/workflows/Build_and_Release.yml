@@ -3,7 +3,8 @@ name: Build & Release (Win + macOS)
 on:
   push:
     branches: [ main ]
-
+permissions:
+  contents: write 
 # -----------------------------------------------------------------------
 jobs:
 # === JOB di build (matrix Windows/macOS) ===============================
