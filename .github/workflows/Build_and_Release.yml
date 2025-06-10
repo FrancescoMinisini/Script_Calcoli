@@ -1,0 +1,87 @@
+name: Build & Release (Win + macOS)
+
+on:
+  push:
+    branches: [ main ]
+
+# -----------------------------------------------------------------------
+jobs:
+# === JOB di build (matrix Windows/macOS) ===============================
+  build:
+    strategy:
+      matrix:
+        os: [ windows-latest, macos-latest ]   # << entrambe le piattaforme
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    # 1) checkout
+    - uses: actions/checkout@v4
+
+    # 2) Python (stessa versione su entrambe le macchine)
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    # 3) dipendenze progetto + PyInstaller
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    # 4) Build one-file
+    - name: PyInstaller build
+      run: |
+        pyinstaller --onefile gait_analysis_gui.py
+      # sulle runner Windows il file sarà dist\gait_analysis_gui.exe,
+      # su macOS dist/gait_analysis_gui (binario CLI) o .app se usi --windowed
+
+    # 5) Rinomina l’output aggiungendo il suffisso piattaforma
+    #    per evitare conflitti quando andremo a scaricare tutti gli artefatti.
+    - name: Rename binary with OS suffix
+      shell: bash
+      run: |
+        if [[ "${{ runner.os }}" == "Windows" ]]; then
+          mv dist/gait_analysis_gui.exe gait_analysis_gui_windows.exe
+        else
+          mv dist/gait_analysis_gui gait_analysis_gui_macos
+        fi
+
+    # 6) Upload artefatto (un nome diverso per ogni matrice)
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gait-analysis-gui-${{ runner.os }}
+        path: gait_analysis_gui_*        # il file rinominato al passo precedente
+
+# === JOB di release (parte dopo che TUTTE le build sono finite) =========
+  release:
+    needs: build           # attende TUTTE le istanze del job 'build'
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1) scarica tutti gli artefatti prodotti dalla matrice
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./release-bin              # qui dentro compariranno i due file
+
+    # 2) opzionale: stampa elenco (debug)
+    - name: List downloaded
+      run: ls -R ./release-bin
+
+    # 3) Crea la GitHub Release con entrambi i binari
+    - name: Create Release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: v${{ github.run_number }}           # semver semplice (cambia a piacere)
+        name: "Build ${{ github.run_number }}"
+        body: |
+          Release automatica generata da push su **main**.
+          - Commit: ${{ github.sha }}
+          - Piattaforme: Windows & macOS
+        draft: false
+        prerelease: false
+        artifacts: ./release-bin/**              # prende tutti i file scaricati
+        token: ${{ secrets.GITHUB_TOKEN }}
